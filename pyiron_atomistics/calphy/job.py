@@ -2,8 +2,11 @@ import os
 import numpy as np
 from typing import Union, List, Tuple
 import pandas as pd
+import yaml
 
 from pyiron_base import DataContainer
+#from pyiron_base.interfaces.object import HasStorage
+
 from pyiron_atomistics.lammps.potential import LammpsPotential, LammpsPotentialFile
 from pyiron_base import GenericJob, ImportAlarm
 from pyiron_atomistics.lammps.structure import (
@@ -15,6 +18,7 @@ from pyiron_atomistics.lammps.structure import (
 from pyiron_atomistics.atomistics.structure.atoms import Atoms
 from pyiron_atomistics.atomistics.structure.atoms import ase_to_pyiron
 from pyiron_atomistics.atomistics.structure.has_structure import HasStructure
+from pyiron_atomistics.atomistics.structure.periodic_table import ChemicalElement
 
 calphy_version = "1.0.0"
 
@@ -23,7 +27,7 @@ with ImportAlarm(
     "requirements. Please install it and try again."
 ) as calphy_alarm:
     from calphy import Calculation, Solid, Liquid, Alchemy
-    from calphy.routines import routine_fe, routine_ts, routine_alchemy, routine_pscale
+    from calphy.routines import routine_fe, routine_ts, routine_alchemy, routine_pscale, routine_composition_scaling
     from calphy import __version__ as calphy_version
     from pyscal.trajectory import Trajectory as PyscalTrajectory
 
@@ -132,7 +136,17 @@ class Calphy(GenericJob, HasStructure):
         self.input._pot_dict_initial = None
         self.input._pot_dict_final = None
         self.__version__ = calphy_version
+        self.input._output_chemical_composition = None
+        self._restrictions = None
+        self._compress_by_default = True
 
+    @property
+    def output(self):
+        if self.status.finished:
+            if not self._output.has_keys():
+                self._output.from_hdf(self.project_hdf5)
+        return self._output
+    
     @property
     def _default_input(self):
         return {
@@ -289,33 +303,31 @@ class Calphy(GenericJob, HasStructure):
 
         return pair_style, pair_coeff
 
-    def _get_element_list(self) -> List[str]:
+    def _get_element_list(self, structure_check=True) -> List[str]:
         """
         Get elements as defined in pair style
-
         Args:
-            None
-
+            structure_check: bool, optional
         Returns:
             list: symbols of the elements
         """
         elements_from_pot = self._potential_initial.get_element_lst()
         elements_struct_lst = self.structure.get_species_symbols()
 
-        elements = []
-        for element_name in elements_from_pot:
-            if element_name in elements_struct_lst:
-                elements.append(element_name)
+        if structure_check:
+            elements = []
+            for element_name in elements_from_pot:
+                if element_name in elements_struct_lst:
+                    elements.append(element_name)
+            return elements
+        else:
+            return elements_from_pot
 
-        return elements
-
-    def _get_masses(self) -> List[float]:
+    def _get_masses(self, structure_check=True) -> List[float]:
         """
         Get masses as defined in pair style
-
         Args:
-            None
-
+            structure_check: bool, optional
         Returns:
             list: masses of the elements
         """
@@ -323,15 +335,70 @@ class Calphy(GenericJob, HasStructure):
         elements_object_lst = self.structure.get_species_objects()
         elements_struct_lst = self.structure.get_species_symbols()
 
-        masses = []
-        for element_name in elements_from_pot:
-            if element_name in elements_struct_lst:
-                index = list(elements_struct_lst).index(element_name)
-                masses.append(elements_object_lst[index].AtomicMass)
+        if structure_check:
+            masses = []
+            for element_name in elements_from_pot:
+                if element_name in elements_struct_lst:
+                    el = ChemicalElement(element_name)
+                    masses.append(el.AtomicMass)
 
-        # this picks the actual masses, now we should pad with 1s to match length
-        length_diff = len(elements_from_pot) - len(masses)
-        return masses, length_diff
+            # this picks the actual masses, now we should pad with 1s to match length
+            length_diff = len(elements_from_pot) - len(masses)
+            return masses, length_diff
+
+        else:
+            masses = []
+            for element_name in elements_from_pot:
+                el = ChemicalElement(element_name)
+                masses.append(el.AtomicMass)
+            return masses, 0
+
+    def _get_input_chemical_composition(self, element_list) -> dict:
+        """
+        Get the input chemical composition
+        """
+
+        compdict = {}
+        chemsymbols = self.structure.get_chemical_symbols()
+        names, counts = np.unique(chemsymbols, return_counts=True)
+
+        for element_name in element_list:
+            if element_name in names:
+                index = list(names).index(element_name)
+                compdict[element_name] = int(counts[index])
+            else:
+                compdict[element_name] = 0
+
+        return compdict    
+
+    def _comp_dict_to_string(self, compdict):
+        """
+        Convert the composition dict to string representation
+        """
+        if isinstance(compdict, dict):
+            compstr = "-".join([f"{key}-{str(int(val))}" for key, val in compdict.items()])
+            return compstr
+        
+    def _comp_dict_from_string(self, compstr):
+        """
+        From a string representation recreate a composition dictionary
+        """
+        if compstr is not None:
+            raw = compstr.split("-")
+            compdict = { raw[j]: int(raw[j+1]) for j in range(0, len(raw), 2)}
+            return compdict
+
+    def compress(self, files_to_compress=None):
+        """
+        Compress the output files of a job object.
+        Args:
+            files_to_compress (list):
+        """
+        if files_to_compress is None:
+            files_to_compress = [
+                f for f in list(self.list_files())
+            ]
+        super().compress(files_to_compress=files_to_compress)
 
     def _potential_from_hdf(self):
         """
@@ -450,6 +517,9 @@ class Calphy(GenericJob, HasStructure):
         if len(self.get_potentials()) == 2:
             self.input.mode = "alchemy"
             self.input.reference_phase = "alchemy"
+        elif self.input._output_chemical_composition is not None:
+            self.input.mode = "composition_scaling"
+            self.input.reference_phase = "alchemy"
         elif isinstance(self.input.pressure, list):
             if len(self.input.pressure) == 2:
                 self.input.mode = "pscale"
@@ -466,10 +536,13 @@ class Calphy(GenericJob, HasStructure):
         """
         Create a calc object
         """
+        keylist = ["md", "tolerance", "nose_hoover", "berendsen", "composition_scaling"]
         calc = Calculation()
+        
         for key in self._default_input.keys():
-            if key not in ["md", "tolerance", "nose_hoover", "berendsen"]:
+            if key not in keylist:
                 setattr(calc, key, self.input[key])
+        
         for key in self._default_input["md"].keys():
             setattr(calc.md, key, self.input["md"][key])
         for key in self._default_input["tolerance"].keys():
@@ -481,14 +554,22 @@ class Calphy(GenericJob, HasStructure):
 
         calc.lattice = os.path.join(self.working_directory, "conf.data")
 
+        structure_check = True
+
+        if calc.mode == "composition_scaling":
+            structure_check = False
+
         pair_style, pair_coeff = self._prepare_pair_styles()
         calc._fix_potential_path = False
         calc.pair_style = pair_style
         calc.pair_coeff = pair_coeff
 
-        calc.element = self._get_element_list()
-        calc.mass, ghost_elements = self._get_masses()
+        calc.element = self._get_element_list(structure_check=structure_check)
+        calc.mass, ghost_elements = self._get_masses(structure_check=structure_check)
         calc._ghost_element_count = ghost_elements
+        if calc.mode == "composition_scaling":
+            calc.composition_scaling.output_chemical_composition = self._comp_dict_from_string(self.input._output_chemical_composition)
+            calc.composition_scaling.input_chemical_composition = self._get_input_chemical_composition(calc.element)
 
         calc.queue.cores = self.server.cores
         return calc
@@ -603,6 +684,37 @@ class Calphy(GenericJob, HasStructure):
         self.input.n_iterations = n_iterations
         self.input.mode = "alchemy"
 
+    def calc_mode_composition_scaling(
+        self,
+        temperature: float = None,
+        pressure: Union[list, float, None] = None,
+        output_chemical_composition: dict = None,
+        n_equilibration_steps: int = 15000,
+        n_switching_steps: int = 25000,
+        n_print_steps: int = 0,
+        n_iterations: int = 1,
+    ):
+        """
+        Perform upsampling/alchemy between two interatomic potentials
+        Args:
+            None
+        Returns:
+            None
+        """
+        if temperature is None:
+            raise ValueError("provide a temperature")
+        if output_chemical_composition is None:
+            raise ValueError("provide an output chemical composition")
+        self.input.temperature = temperature
+        self.input.pressure = pressure
+        self.input.reference_phase = reference_phase
+        self.input.n_equilibration_steps = n_equilibration_steps
+        self.input.n_switching_steps = n_switching_steps
+        self.input.n_print_steps = n_print_steps
+        self.input.n_iterations = n_iterations
+        self.input._output_chemical_composition = self._comp_dict_to_string(output_chemical_composition)
+        self.input.mode = "composition_scaling"
+
     def calc_mode_pscale(
         self,
         temperature: float = None,
@@ -645,6 +757,7 @@ class Calphy(GenericJob, HasStructure):
         n_switching_steps: int = 25000,
         n_print_steps: int = 0,
         n_iterations: int = 1,
+        output_chemical_composition: dict = None,
     ):
         """
         Calculate free energy at given conditions
@@ -664,8 +777,9 @@ class Calphy(GenericJob, HasStructure):
         self.input.n_switching_steps = n_switching_steps
         self.input.n_print_steps = n_print_steps
         self.input.n_iterations = n_iterations
+        self.input._output_chemical_composition = self._comp_dict_to_string(output_chemical_composition)
         self._determine_mode()
-        if self.input.mode != "alchemy":
+        if not self.input.mode in ["alchemy", "composition_scaling"]:
             if reference_phase is None:
                 raise ValueError("provide a reference_phase")
 
@@ -689,12 +803,16 @@ class Calphy(GenericJob, HasStructure):
             routine_ts(job)
         elif self.input.mode == "pscale":
             routine_pscale(job)
+        elif self.input.mode == "composition_scaling":
+            routine_composition_scaling(job)
         else:
             raise ValueError("Unknown mode")
-        self._data = job.report
+        #self._data = job.report
         # save conc for later use
         self.input.concentration = job.concentration
-        del self._data["input"]
+        #del self._data["input"]
+        #self.run()
+        #breakpoint()
         self.status.collect = True
         self.run()
 
@@ -817,6 +935,14 @@ class Calphy(GenericJob, HasStructure):
                 self.output["ps/backward/volume"] = list(b_vol)
                 self.output["ps/forward/pressure"] = list(f_press)
                 self.output["ps/backward/pressure"] = list(b_press)
+            
+            elif self.input.mode == "composition_scaling":
+                datfile = os.path.join(self.working_directory, "composition_sweep.dat")
+                fl, netfe, warr, mcorrarr = np.loadtxt(datfile, unpack=True, usecols=(0, 1, 2, 3))
+                self._output["composition_scaling/lambda"] = list(fl)
+                self._output["composition_scaling/energy_free"] = list(netfe)
+                self._output["composition_scaling/energy_work"] = list(warr)
+                self._output["composition_scaling/mass_correction"] = list(mcorrarr)
 
     def _collect_ediff(self):
         """
